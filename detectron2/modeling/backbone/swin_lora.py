@@ -22,11 +22,189 @@ import torch.utils.checkpoint as checkpoint
 
 from detectron2.modeling.backbone.backbone import Backbone
 
-
+from loralib import *
 
 _to_2tuple = nn.modules.utils._ntuple(2)
 
+# loralib code from Hu et al.
+class LoRALayer():
+    def __init__(
+        self, 
+        r: int, 
+        lora_alpha: int, 
+        lora_dropout: float,
+        merge_weights: bool,
+    ):
+        self.r = r
+        self.lora_alpha = lora_alpha
+        # Optional dropout
+        if lora_dropout > 0.:
+            self.lora_dropout = nn.Dropout(p=lora_dropout)
+        else:
+            self.lora_dropout = lambda x: x
+        # Mark the weight as unmerged
+        self.merged = False
+        self.merge_weights = merge_weights
 
+# DCLoRA code from other Hu et al. 
+def shift_batch_stats(batch, mean, var, dim=0):
+    # DEBUG 
+    DEBUG = True
+    log_file = "/ws/fs_mount/logs/ist_lora_stats.log"
+
+    batch = batch.to(torch.float32).detach()
+    batch_size = batch.size(dim)
+
+    batch_mean = torch.mean(batch, dim=dim)
+
+    #batch_var= torch.var(batch, dim=dim)
+    # Maybe mask out the zero batch stddev parts
+    sigma = torch.sqrt(var) 
+    batch_sigma = torch.std(batch, dim=dim) 
+    # DEV
+    if DEBUG: 
+        batch_sigma_mask = (batch_sigma!=0).to(torch.float32)
+        match_zeroes = ((sigma == 0) & (batch_sigma == 0)).to(torch.float32)
+        div_zeroes = ((sigma != 0) & (batch_sigma == 0)).to(torch.float32)
+    if DEBUG:
+        with open(log_file, "a") as lf:
+            lf.write(f"match_zero: {match_zeroes.sum().item()}, div_zero: {div_zeroes.sum().item()}\n")
+
+    rescale = torch.div(sigma, batch_sigma)
+    if DEBUG:
+        with open(log_file, "a") as lf:
+            lf.write(f"rescale_min: {torch.min(rescale).item()}, rescale_max: {torch.max(rescale).item()}\n")
+    bias = torch.sub(mean, torch.mul(batch_mean, rescale))
+
+    batch_split = torch.tensor_split(batch, batch_size, dim=dim)
+    batch_stack = []
+    for x in batch_split:
+        x = torch.squeeze(x)
+        rescale_x = torch.mul(x, rescale)
+        rescale_x = torch.add(rescale_x, bias)
+        rescale_x = torch.nan_to_num(rescale_x, nan=9e6) # Replace nans
+        rescale_x = torch.mul(rescale_x, batch_sigma_mask)
+        batch_mask_complement = 1 - batch_sigma_mask
+        rescale_x = torch.add(rescale_x, torch.mul(x, batch_mask_complement))
+        batch_stack.append(rescale_x)
+
+    new_batch = torch.stack(batch_stack, dim=dim)
+    new_batch = new_batch.to(torch.float32)
+    return new_batch
+
+class ISTStatMergedLinear(nn.Linear, LoRALayer):
+    # LoRA implemented in a dense layer with batchnorm layer for IST
+    def __init__(
+        self, 
+        in_features: int, 
+        out_features: int, 
+        r: int = 0, 
+        lora_alpha: int = 1, 
+        lora_dropout: float = 0.,
+        enable_lora: List[bool] = [False],
+        fan_in_fan_out: bool = False, # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
+        merge_weights: bool = True,
+        enable_stats: bool = False,
+        seq_len: int = 0,
+        **kwargs
+    ):
+        nn.Linear.__init__(self, in_features, out_features, **kwargs)
+        LoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+                           merge_weights=merge_weights)
+
+        assert out_features % len(enable_lora) == 0, \
+            'The length of enable_lora must divide out_features'
+        self.enable_lora = enable_lora
+        self.fan_in_fan_out = fan_in_fan_out
+        self.enable_stats = enable_stats
+        # Actual trainable parameters
+        if r > 0 and any(enable_lora):
+            self.lora_A = nn.Parameter(self.weight.new_zeros((r * sum(enable_lora), in_features)))
+            self.lora_B = nn.Parameter(self.weight.new_zeros((out_features // len(enable_lora) * sum(enable_lora), r)))
+            self.lora_stat_mean = nn.Parameter(self.weight.new_zeros((seq_len, out_features))) # Find cleaner solution than this ad hoc find embedding length
+            self.lora_stat_var = nn.Parameter(self.weight.new_zeros((seq_len, out_features)))
+            #self.lora_BN = nn.BatchNorm1d(r, momentum=1.0, affine=True, track_running_stats=False) # Add batchnorm for IST
+            #self.lora_BN_output = nn.BatchNorm1d(out_features, momentum=1.0, affine=False, track_running_stats=False) # What if we apply BN at end 
+            self.merge_weights = False # For now with the BN stuff don't merge weights
+            self.scaling = self.lora_alpha / self.r
+            
+            # Freezing the pre-trained weight matrix
+            self.weight.requires_grad = False
+            self.lora_ind = self.weight.new_zeros(
+                (out_features, ), dtype=torch.bool
+            ).view(len(enable_lora), -1)
+            self.lora_ind[enable_lora, :] = True
+            self.lora_ind = self.lora_ind.view(-1)
+        self.reset_parameters()
+        if fan_in_fan_out:
+            self.weight.data = self.weight.data.transpose(0, 1)
+
+    def reset_parameters(self):
+        nn.Linear.reset_parameters(self)
+        if hasattr(self, 'lora_A'):
+            # initialize B the same way as the default for nn.Linear and A to zero
+            # this is different than what is described in the paper but should not affect performance
+            nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B)
+
+    def zero_pad(self, x):
+        result = x.new_zeros((len(self.lora_ind), *x.shape[1:]))
+        result[self.lora_ind] = x
+        return result
+
+    def merge_AB(self):
+        def T(w):
+            return w.transpose(0, 1) if self.fan_in_fan_out else w
+        delta_w = F.conv1d(
+            self.lora_A.unsqueeze(0),
+            self.lora_B.unsqueeze(-1),
+            groups=sum(self.enable_lora)
+        ).squeeze(0)
+        return T(self.zero_pad(delta_w))
+
+    def train(self, mode: bool = True):
+        # Presumably batch norm not factored here
+        def T(w):
+            return w.transpose(0, 1) if self.fan_in_fan_out else w
+        nn.Linear.train(self, mode)
+        if mode:
+            if self.merge_weights and self.merged:
+                # Make sure that the weights are not merged
+                if self.r > 0 and any(self.enable_lora):
+                    self.weight.data -= self.merge_AB() * self.scaling
+                self.merged = False
+        else:
+            if self.merge_weights and not self.merged:
+                # Merge the weights and mark it
+                if self.r > 0 and any(self.enable_lora):
+                    self.weight.data += self.merge_AB() * self.scaling
+                self.merged = True       
+
+    def forward(self, x: torch.Tensor):
+        def T(w):
+            return w.transpose(0, 1) if self.fan_in_fan_out else w
+        print("DEBUG:", x.shape)
+        if self.r > 0 and not self.merged:
+            result = F.linear(x, T(self.weight), bias=self.bias)            
+            #result += (self.lora_BN(self.lora_dropout(x) @ self.lora_A.transpose(0, 1)) @ self.lora_B.transpose(0, 1)) * self.scaling
+            #y = self.lora_dropout(x) @ self.lora_A.transpose(0,1)
+            #y = self.lora_BN(y.transpose(1,2)).transpose(2,1)
+            #y = y @ self.lora_B.transpose(0, 1)
+            #y = self.lora_BN_output(y.transpose(1,2)).transpose(2,1)
+            #y = y * self.scaling
+            y = self.lora_dropout(x) @ T(self.merge_AB().T) * self.scaling
+
+            if self.enable_stats:
+                y = shift_batch_stats(y, self.lora_stat_mean, self.lora_stat_var, dim=0)
+
+            result += y 
+            y = y.detach()
+            return result, y
+        else:
+            return F.linear(x, T(self.weight), bias=self.bias)
+        
+# Original Swin code with some renaming
+        
 class Mlp(nn.Module):
     """Multilayer perceptron."""
 
@@ -80,7 +258,7 @@ def window_reverse(windows, window_size, H, W):
     return x
 
 
-class WindowAttention(nn.Module):
+class WindowAttentionLoRA(nn.Module):
     """Window based multi-head self attention (W-MSA) module with relative position bias.
     It supports both of shifted and non-shifted window.
     Args:
@@ -103,6 +281,9 @@ class WindowAttention(nn.Module):
         qk_scale=None,
         attn_drop=0.0,
         proj_drop=0.0,
+        r=16,
+        enable_lora_flags=[True, True, True],
+        seq_len=0
     ):
 
         super().__init__()
@@ -131,6 +312,7 @@ class WindowAttention(nn.Module):
         self.register_buffer("relative_position_index", relative_position_index)
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.qkv = ISTStatMergedLinear(dim, dim * 3, r, enable_lora=enable_lora_flags, seq_len=seq_len, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
@@ -181,7 +363,7 @@ class WindowAttention(nn.Module):
         return x
 
 
-class SwinTransformerBlock(nn.Module):
+class SwinTransformerBlockLoRA(nn.Module):
     """Swin Transformer Block.
     Args:
         dim (int): Number of input channels.
@@ -212,6 +394,8 @@ class SwinTransformerBlock(nn.Module):
         drop_path=0.0,
         act_layer=nn.GELU,
         norm_layer=nn.LayerNorm,
+        r=16,
+        seq_len=0
     ):
         super().__init__()
         self.dim = dim
@@ -222,7 +406,7 @@ class SwinTransformerBlock(nn.Module):
         assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
 
         self.norm1 = norm_layer(dim)
-        self.attn = WindowAttention(
+        self.attn = WindowAttentionLoRA(
             dim,
             window_size=_to_2tuple(self.window_size),
             num_heads=num_heads,
@@ -230,6 +414,8 @@ class SwinTransformerBlock(nn.Module):
             qk_scale=qk_scale,
             attn_drop=attn_drop,
             proj_drop=drop,
+            r=r,
+            seq_len=seq_len
         )
 
         if drop_path > 0.0:
@@ -352,7 +538,7 @@ class PatchMerging(nn.Module):
         return x
 
 
-class BasicLayer(nn.Module):
+class BasicLayerLoRA(nn.Module):
     """A basic Swin Transformer layer for one stage.
     Args:
         dim (int): Number of feature channels
@@ -378,6 +564,8 @@ class BasicLayer(nn.Module):
         num_heads,
         window_size=7,
         mlp_ratio=4.0,
+        r=16,
+        seq_len=0,
         qkv_bias=True,
         qk_scale=None,
         drop=0.0,
@@ -396,7 +584,7 @@ class BasicLayer(nn.Module):
         # build blocks
         self.blocks = nn.ModuleList(
             [
-                SwinTransformerBlock(
+                SwinTransformerBlockLoRA(
                     dim=dim,
                     num_heads=num_heads,
                     window_size=window_size,
@@ -408,6 +596,8 @@ class BasicLayer(nn.Module):
                     attn_drop=attn_drop,
                     drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
                     norm_layer=norm_layer,
+                    r=r,
+                    seq_len=seq_len
                 )
                 for i in range(depth)
             ]
@@ -511,7 +701,7 @@ class PatchEmbed(nn.Module):
         return x
 
 
-class SwinTransformer(Backbone):
+class SwinTransformerLoRA(Backbone):
     """Swin Transformer backbone.
         A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted
             Windows`  - https://arxiv.org/pdf/2103.14030
@@ -549,6 +739,7 @@ class SwinTransformer(Backbone):
         num_heads=(3, 6, 12, 24),
         window_size=7,
         mlp_ratio=4.0,
+        r=16,
         qkv_bias=True,
         qk_scale=None,
         drop_rate=0.0,
@@ -578,7 +769,7 @@ class SwinTransformer(Backbone):
             embed_dim=embed_dim,
             norm_layer=norm_layer if self.patch_norm else None,
         )
-
+        seq_len = patch_size
         # absolute position embedding
         if self.ape:
             pretrain_img_size = _to_2tuple(pretrain_img_size)
@@ -603,12 +794,14 @@ class SwinTransformer(Backbone):
         # build layers
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
-            layer = BasicLayer(
+            layer = BasicLayerLoRA(
                 dim=int(embed_dim * 2**i_layer),
                 depth=depths[i_layer],
                 num_heads=num_heads[i_layer],
                 window_size=window_size,
                 mlp_ratio=mlp_ratio,
+                r=r,
+                seq_len=seq_len, # Determine this
                 qkv_bias=qkv_bias,
                 qk_scale=qk_scale,
                 drop=drop_rate,
